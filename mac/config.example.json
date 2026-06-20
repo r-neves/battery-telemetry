@@ -1,0 +1,15 @@
+{
+  "mqtt": {
+    "host": "IP_ADDRESS_OR_HOSTNAME",
+    "port": 1883,
+    "username": "CHANGE_ME",
+    "password": "CHANGE_ME",
+    "tls": false
+  },
+  "device": {
+    "name": "My MacBook Pro",
+    "id": "my_macbook_pro"
+  },
+  "discovery_prefix": "homeassistant",
+  "interval_seconds": 60
+}
