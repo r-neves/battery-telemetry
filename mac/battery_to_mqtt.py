@@ -244,8 +244,8 @@ def build_bluetooth_messages(cfg: dict, devices: list[dict]) -> list[dict]:
     `source` attribute records which Mac last reported the value.
     """
     prefix = cfg["discovery_prefix"]
-    expire = max(60, int(cfg["interval_seconds"]) * 3)
     source = cfg["device"]["name"]
+    now_str = time.strftime("%Y-%m-%d %H:%M:%S")
 
     messages: list[dict] = []
     for dev in devices:
@@ -270,16 +270,19 @@ def build_bluetooth_messages(cfg: dict, devices: list[dict]) -> list[dict]:
                 "state_topic": state_topic,
                 "value_template": f"{{{{ value_json.{key} if value_json.{key} is not none else 'unknown' }}}}",
                 "json_attributes_topic": state_topic,
-                "json_attributes_template": "{{ {'source': value_json.source} | tojson }}",
+                "json_attributes_template": "{{ {'source': value_json.source, 'last_seen': value_json.last_seen} | tojson }}",
                 "device_class": "battery",
                 "unit_of_measurement": "%",
                 "device": device_block,
-                "expire_after": expire,
+                # No expire_after: peripherals keep showing their last-seen
+                # value (from the retained state) after they disconnect.
+                # `last_seen` tells you how stale it is.
             }
             messages.append({"topic": cfg_topic, "payload": json.dumps(payload), "retain": True})
 
         state = dict(dev["batteries"])
         state["source"] = source
+        state["last_seen"] = now_str
         messages.append(
             {"topic": state_topic, "payload": json.dumps(state), "retain": True}
         )
