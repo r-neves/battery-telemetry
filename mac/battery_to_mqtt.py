@@ -18,7 +18,10 @@ import re
 import socket
 import subprocess
 import sys
+import threading
+import time
 
+import paho.mqtt.client as mqtt_client
 import paho.mqtt.publish as publish
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -45,6 +48,7 @@ def load_config(path: str) -> dict:
 
     cfg.setdefault("discovery_prefix", "homeassistant")
     cfg.setdefault("interval_seconds", 60)
+    cfg.setdefault("bluetooth", True)  # also publish connected BT peripherals
     return cfg
 
 
@@ -112,6 +116,61 @@ def read_battery() -> dict:
 
 
 # --------------------------------------------------------------------------- #
+# Bluetooth peripherals (AirPods, mice, keyboards, …)
+# --------------------------------------------------------------------------- #
+# system_profiler key suffix -> (state key, friendly sensor name)
+BT_BATTERY_SUFFIX = {
+    "": ("level", "Battery"),
+    "Main": ("level", "Battery"),
+    "Left": ("left", "Left"),
+    "Right": ("right", "Right"),
+    "Case": ("case", "Case"),
+}
+
+
+def _parse_pct(value) -> int | None:
+    if isinstance(value, (int, float)):
+        return int(value)
+    m = re.search(r"(\d+)", str(value))
+    return int(m.group(1)) if m else None
+
+
+def read_bluetooth() -> list[dict]:
+    """Currently-connected Bluetooth devices that report a battery level."""
+    try:
+        out = _run(["system_profiler", "SPBluetoothDataType", "-json"])
+        data = json.loads(out)
+    except (subprocess.CalledProcessError, json.JSONDecodeError):
+        return []
+
+    devices: list[dict] = []
+    for controller in data.get("SPBluetoothDataType", []):
+        for entry in controller.get("device_connected", []):
+            for name, props in entry.items():
+                if not isinstance(props, dict):
+                    continue
+                batteries: dict[str, int] = {}
+                for k, v in props.items():
+                    if not k.startswith("device_batteryLevel"):
+                        continue
+                    key, _ = BT_BATTERY_SUFFIX.get(k[len("device_batteryLevel"):], (None, None))
+                    pct = _parse_pct(v)
+                    if key and pct is not None:
+                        batteries[key] = pct
+                if not batteries:
+                    continue  # connected but no battery reported (skip)
+                addr = props.get("device_address", "")
+                devices.append({
+                    "name": name.strip(),
+                    "address": addr,
+                    "id": re.sub(r"[^a-z0-9]", "", addr.lower()) or re.sub(r"[^a-z0-9]", "", name.lower()),
+                    "minor_type": props.get("device_minorType"),
+                    "batteries": batteries,
+                })
+    return devices
+
+
+# --------------------------------------------------------------------------- #
 # Sensor definitions (HA MQTT discovery)
 # --------------------------------------------------------------------------- #
 # key -> (Friendly Name, device_class, unit, icon)
@@ -175,6 +234,134 @@ def build_messages(cfg: dict, battery: dict) -> list[dict]:
     return messages
 
 
+def build_bluetooth_messages(cfg: dict, devices: list[dict]) -> list[dict]:
+    """One shared, host-independent HA device per peripheral.
+
+    Identity is keyed only on the peripheral's Bluetooth address — discovery
+    topic, unique_id, device identifiers and state topic all omit the
+    publishing Mac. So several Macs running this script publish to the *exact
+    same* retained topics: it shows up once in HA, last-writer-wins. A
+    `source` attribute records which Mac last reported the value.
+    """
+    prefix = cfg["discovery_prefix"]
+    expire = max(60, int(cfg["interval_seconds"]) * 3)
+    source = cfg["device"]["name"]
+
+    messages: list[dict] = []
+    for dev in devices:
+        bt_id = dev["id"]
+        state_topic = f"battery-telemetry/bluetooth/{bt_id}/state"
+
+        device_block = {
+            "identifiers": [f"battery_telemetry_bt_{bt_id}"],
+            "name": dev["name"],
+        }
+        if dev.get("address"):
+            device_block["connections"] = [["mac", dev["address"]]]
+        if dev.get("minor_type"):
+            device_block["model"] = dev["minor_type"]
+
+        for key in dev["batteries"]:
+            friendly = dict(BT_BATTERY_SUFFIX.values()).get(key, key.title())
+            cfg_topic = f"{prefix}/sensor/bt_{bt_id}/{key}/config"
+            payload = {
+                "name": friendly,
+                "unique_id": f"battery_telemetry_bt_{bt_id}_{key}",
+                "state_topic": state_topic,
+                "value_template": f"{{{{ value_json.{key} if value_json.{key} is not none else 'unknown' }}}}",
+                "json_attributes_topic": state_topic,
+                "json_attributes_template": "{{ {'source': value_json.source} | tojson }}",
+                "device_class": "battery",
+                "unit_of_measurement": "%",
+                "device": device_block,
+                "expire_after": expire,
+            }
+            messages.append({"topic": cfg_topic, "payload": json.dumps(payload), "retain": True})
+
+        state = dict(dev["batteries"])
+        state["source"] = source
+        messages.append(
+            {"topic": state_topic, "payload": json.dumps(state), "retain": True}
+        )
+    return messages
+
+
+# --------------------------------------------------------------------------- #
+# MQTT helpers
+# --------------------------------------------------------------------------- #
+def _mqtt_auth_tls(cfg: dict):
+    mqtt = cfg["mqtt"]
+    auth = None
+    if mqtt.get("username"):
+        auth = {"username": mqtt["username"], "password": mqtt.get("password", "")}
+    tls = {} if mqtt.get("tls") else None
+    return auth, tls
+
+
+def prune_legacy_bluetooth(cfg: dict) -> int:
+    """Clear retained discovery/state left by the old per-Mac Bluetooth scheme.
+
+    Before peripherals became host-independent, this Mac published discovery to
+    `<prefix>/sensor/<mac_id>_bt_<addr>/<key>/config` and state to
+    `battery-telemetry/<mac_id>/bluetooth/<addr>/state`. Those retained
+    messages reuse the new `unique_id`s, so HA rejects the new (shared) configs
+    until they're gone. This subscribes, finds every such retained topic, and
+    publishes an empty retained payload to delete it.
+    """
+    mac = cfg["mqtt"]
+    mac_id = cfg["device"]["id"]
+    prefix = cfg["discovery_prefix"]
+    legacy_node = f"{mac_id}_bt_"
+
+    found: set[str] = set()
+    settled = threading.Event()
+
+    def on_connect(client, userdata, flags, reason_code, properties=None):
+        client.subscribe(f"{prefix}/sensor/+/+/config")
+        client.subscribe("battery-telemetry/+/bluetooth/+/state")
+
+    def on_message(client, userdata, msg):
+        if not msg.retain or not msg.payload:
+            return  # only delete non-empty retained messages
+        parts = msg.topic.split("/")
+        # legacy discovery: <prefix>/sensor/<mac_id>_bt_<addr>/<key>/config
+        is_cfg = (msg.topic.endswith("/config") and len(parts) >= 4
+                  and parts[1] == "sensor" and parts[2].startswith(legacy_node))
+        # legacy state: battery-telemetry/<mac_id>/bluetooth/<addr>/state
+        is_state = (len(parts) == 5 and parts[0] == "battery-telemetry"
+                    and parts[1] == mac_id and parts[2] == "bluetooth")
+        if is_cfg or is_state:
+            found.add(msg.topic)
+
+    client = mqtt_client.Client(
+        callback_api_version=mqtt_client.CallbackAPIVersion.VERSION2,
+        client_id=f"battery-telemetry-prune-{mac_id}",
+    )
+    auth, tls = _mqtt_auth_tls(cfg)
+    if auth:
+        client.username_pw_set(auth["username"], auth["password"])
+    if tls is not None:
+        client.tls_set()
+    client.on_connect = on_connect
+    client.on_message = on_message
+    client.connect(mac["host"], int(mac["port"]))
+    client.loop_start()
+    try:
+        time.sleep(2.0)  # let retained messages flush in
+        # Publish the deletions while the network loop is still running,
+        # otherwise wait_for_publish() blocks forever.
+        for topic in sorted(found):
+            info = client.publish(topic, payload=b"", retain=True, qos=1)
+            info.wait_for_publish(timeout=5)
+            print(f"  cleared {topic}")
+    finally:
+        client.loop_stop()
+        client.disconnect()
+
+    print(f"Pruned {len(found)} legacy Bluetooth topic(s) for '{cfg['device']['name']}'.")
+    return 0
+
+
 # --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
@@ -186,6 +373,8 @@ def main() -> int:
         help="Path to config.json (default: alongside this script).",
     )
     ap.add_argument("--dry-run", action="store_true", help="Print what would be published; don't connect.")
+    ap.add_argument("--prune-legacy-bt", action="store_true",
+                    help="Clear retained discovery/state from the old per-Mac Bluetooth scheme, then exit.")
     args = ap.parse_args()
 
     if not os.path.exists(args.config):
@@ -195,21 +384,27 @@ def main() -> int:
         return 1
 
     cfg = load_config(args.config)
+
+    if args.prune_legacy_bt:
+        return prune_legacy_bluetooth(cfg)
+
     battery = read_battery()
     messages = build_messages(cfg, battery)
 
+    bt_devices = read_bluetooth() if cfg.get("bluetooth", True) else []
+    messages += build_bluetooth_messages(cfg, bt_devices)
+
     if args.dry_run:
         print("Battery:", json.dumps(battery, indent=2))
+        print("Bluetooth:", json.dumps(
+            [{d["name"]: d["batteries"]} for d in bt_devices], ensure_ascii=False))
         print(f"\n{len(messages)} MQTT messages -> {cfg['mqtt']['host']}:{cfg['mqtt']['port']}")
         for m in messages:
             print(f"  {m['topic']}  {m['payload']}")
         return 0
 
     mqtt = cfg["mqtt"]
-    auth = None
-    if mqtt.get("username"):
-        auth = {"username": mqtt["username"], "password": mqtt.get("password", "")}
-    tls = {} if mqtt.get("tls") else None
+    auth, tls = _mqtt_auth_tls(cfg)
 
     publish.multiple(
         messages,
@@ -219,8 +414,10 @@ def main() -> int:
         auth=auth,
         tls=tls,
     )
+    bt_summary = ", ".join(d["name"] for d in bt_devices) or "none"
     print(f"Published battery ({battery.get('percent')}%, {battery.get('state')}) "
-          f"to {mqtt['host']} as '{cfg['device']['name']}'.")
+          f"to {mqtt['host']} as '{cfg['device']['name']}'. "
+          f"Bluetooth devices: {bt_summary}.")
     return 0
 
 

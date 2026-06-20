@@ -52,6 +52,11 @@ dry-run: venv
 run: venv $(CONFIG)
 	$(PYTHON) $(SCRIPT)
 
+## prune-legacy-bt: Clear retained topics from the old per-Mac Bluetooth scheme
+.PHONY: prune-legacy-bt
+prune-legacy-bt: venv $(CONFIG)
+	$(PYTHON) $(SCRIPT) --prune-legacy-bt
+
 ## install: Install & start the launchd job (runs on interval_seconds)
 .PHONY: install
 install: venv $(CONFIG)
