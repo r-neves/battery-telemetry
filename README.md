@@ -22,18 +22,38 @@ Sensors created: Battery Level, Charging State, Power Adapter, Time
 Remaining, Cycle Count, Battery Health, Battery Temperature.
 
 It also publishes the battery of **connected Bluetooth peripherals**
-(AirPods, mice, keyboards…) read from `system_profiler SPBluetoothDataType`.
-AirPods get Left/Right/Case sensors; mice/keyboards get a single Battery.
-Only devices that are *currently connected and report a battery* appear —
-when one disconnects, its sensors go unavailable (via `expire_after`) and
-the device stays in HA. Set `"bluetooth": false` in `config.json` to disable.
+(AirPods, mice, keyboards…). AirPods get Left/Right/Case sensors;
+mice/keyboards get a single Battery. Only devices that are *currently
+connected and report a battery* appear — when one disconnects it keeps
+showing its last reading, and the `last_seen` attribute tells you how stale
+that is. Set `"bluetooth": false` in `config.json` to disable.
+
+**Levels are read live over BLE where possible.** `system_profiler
+SPBluetoothDataType` serves a cache that macOS refreshes only
+opportunistically: for a BLE peripheral it often reads the Battery Service
+once at connect and never again, so a device can sit pinned at a wrong value
+indefinitely (a Glove80 stuck at 100% is the classic symptom), and sometimes
+it reports no battery at all. So for any peripheral exposing the BLE Battery
+Service, [`mac/ble_battery.py`](mac/ble_battery.py) reads characteristic
+`0x2A19` directly via CoreBluetooth — always a live value. It only touches
+peripherals macOS is *already* connected to, so there's no scan and it costs
+well under a second. `system_profiler` remains the fallback, and is still the
+only source for classic-Bluetooth accessories like AirPods, which have no
+GATT Battery Service. Each sensor's `battery_source` attribute records which
+path produced the value.
 
 **Bluetooth devices are host-independent.** Their MQTT topics, `unique_id`
-and HA device identity are keyed only on the peripheral's Bluetooth address —
-*not* on the publishing Mac. So if you run this on several Macs, a peripheral
-shows up **once** in HA (no duplicates, no `unique_id` collisions), with
-last-writer-wins: whichever Mac most recently saw it connected sets the
-value. Each battery sensor carries a `source` attribute naming that Mac.
+and HA device identity are keyed on the peripheral's *name* — not on the
+publishing Mac, and deliberately **not** on its Bluetooth address. AirPods
+(and an AirPods case broadcasting on its own) rotate their address for
+privacy, and different Macs observe different addresses for the same
+accessory, so an address-keyed identity minted a brand-new HA device on every
+rotation and abandoned the last one. The name is stable across rotations,
+reboots and Macs (it syncs via iCloud). So if you run this on several Macs, a
+peripheral shows up **once** in HA, last-writer-wins: whichever Mac most
+recently saw it connected sets the value. Each battery sensor carries a
+`source` attribute naming that Mac and an `address` attribute with the
+address last observed.
 
 ### Setup
 
@@ -89,6 +109,23 @@ make status      # is the job loaded?
 make logs        # tail mac/battery-telemetry.log
 make uninstall   # stop + remove the job
 ```
+
+### Clearing duplicate Bluetooth devices
+
+If HA shows a pile of inactive duplicates of the same peripheral — typically
+AirPods `Case`/`Left`/`Right` entities, one set per rotated address — those
+were created by the old address-keyed identity. Clear them **once**, from any
+one Mac (this step is host-independent):
+
+```bash
+make prune-orphan-bt-dry   # preview exactly which retained topics go
+make prune-orphan-bt       # delete them
+make run                   # republish under the name-based identity
+```
+
+It only ever matches nodes whose id is a bare 12-hex-digit address, which the
+name-based ids can't collide with. Any duplicate HA devices left in the UI
+afterwards can be deleted there; they won't come back.
 
 ### Migrating Bluetooth from an older version
 

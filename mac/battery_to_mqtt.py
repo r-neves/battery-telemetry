@@ -8,6 +8,11 @@ via `expire_after` if updates stop arriving.
 
 Data comes from `pmset -g batt` (percentage, charge state, time remaining)
 and `ioreg` (cycle count, health, temperature).
+
+Connected Bluetooth peripherals are published too, as shared host-independent
+devices keyed on the peripheral's name (see read_bluetooth). Their levels come
+from CoreBluetooth where a BLE Battery Service exists and from
+`system_profiler` otherwise.
 """
 from __future__ import annotations
 
@@ -20,11 +25,16 @@ import subprocess
 import sys
 import threading
 import time
+import unicodedata
 
 import paho.mqtt.client as mqtt_client
 import paho.mqtt.publish as publish
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+import ble_battery  # noqa: E402  (needs HERE on sys.path)
 
 
 # --------------------------------------------------------------------------- #
@@ -135,20 +145,50 @@ def _parse_pct(value) -> int | None:
     return int(m.group(1)) if m else None
 
 
+def _slug(text: str) -> str:
+    """Stable [a-z0-9_] key from a device name (drops accents, punctuation)."""
+    # Drop apostrophes rather than letting them become separators, so the
+    # typographic form macOS uses in "Rodrigo’s AirPods" and a plain ASCII
+    # quote collapse to the same key instead of two different ones.
+    text = re.sub(r"['‘’ʼ]", "", text)
+    ascii_text = (unicodedata.normalize("NFKD", text)
+                  .encode("ascii", "ignore").decode("ascii"))
+    return re.sub(r"_+", "_", re.sub(r"[^a-z0-9]+", "_", ascii_text.lower())).strip("_")
+
+
 def read_bluetooth() -> list[dict]:
-    """Currently-connected Bluetooth devices that report a battery level."""
+    """Currently-connected Bluetooth devices that report a battery level.
+
+    Identity is the slugified device *name*, never the Bluetooth address.
+    AirPods (and an AirPods case broadcasting on its own) rotate their address
+    for privacy, and different Macs observe different addresses for the same
+    accessory -- keying on the address minted a brand-new Home Assistant device
+    on every rotation. The name is stable across rotations, across reboots and
+    across Macs (it syncs via iCloud). Identical names within one scan are
+    disambiguated with an address suffix.
+
+    Levels come from CoreBluetooth where the peripheral exposes the BLE Battery
+    Service, because system_profiler serves a cache that can be badly stale;
+    system_profiler is the fallback for everything else (AirPods and other
+    classic-Bluetooth accessories don't expose a GATT Battery Service).
+    """
     try:
         out = _run(["system_profiler", "SPBluetoothDataType", "-json"])
         data = json.loads(out)
     except (subprocess.CalledProcessError, json.JSONDecodeError):
         return []
 
+    # Keyed by slug, not raw name: CoreBluetooth and system_profiler can
+    # differ in whitespace/case for the same peripheral.
+    live = {_slug(n): pct for n, pct in ble_battery.read_ble_batteries().items()}
+
     devices: list[dict] = []
     for controller in data.get("SPBluetoothDataType", []):
         for entry in controller.get("device_connected", []):
-            for name, props in entry.items():
+            for raw_name, props in entry.items():
                 if not isinstance(props, dict):
                     continue
+                name = raw_name.strip()
                 batteries: dict[str, int] = {}
                 for k, v in props.items():
                     if not k.startswith("device_batteryLevel"):
@@ -157,16 +197,33 @@ def read_bluetooth() -> list[dict]:
                     pct = _parse_pct(v)
                     if key and pct is not None:
                         batteries[key] = pct
+
+                # A live GATT read always beats the system_profiler cache.
+                source = "system_profiler"
+                slug = _slug(name)
+                if slug in live:
+                    batteries["level"] = live[slug]
+                    source = "corebluetooth" if len(batteries) == 1 else "mixed"
+
                 if not batteries:
                     continue  # connected but no battery reported (skip)
-                addr = props.get("device_address", "")
                 devices.append({
-                    "name": name.strip(),
-                    "address": addr,
-                    "id": re.sub(r"[^a-z0-9]", "", addr.lower()) or re.sub(r"[^a-z0-9]", "", name.lower()),
+                    "name": name,
+                    "address": props.get("device_address", ""),
+                    "id": slug,
                     "minor_type": props.get("device_minorType"),
                     "batteries": batteries,
+                    "battery_source": source,
                 })
+
+    # Two connected devices sharing a name (e.g. a pair of controllers) would
+    # otherwise collapse into one entity; fall back to the address for those.
+    counts: dict[str, int] = {}
+    for dev in devices:
+        counts[dev["id"]] = counts.get(dev["id"], 0) + 1
+    for dev in devices:
+        if counts[dev["id"]] > 1 and dev["address"]:
+            dev["id"] = f"{dev['id']}_{_slug(dev['address'])}"
     return devices
 
 
@@ -237,11 +294,13 @@ def build_messages(cfg: dict, battery: dict) -> list[dict]:
 def build_bluetooth_messages(cfg: dict, devices: list[dict]) -> list[dict]:
     """One shared, host-independent HA device per peripheral.
 
-    Identity is keyed only on the peripheral's Bluetooth address — discovery
-    topic, unique_id, device identifiers and state topic all omit the
-    publishing Mac. So several Macs running this script publish to the *exact
-    same* retained topics: it shows up once in HA, last-writer-wins. A
-    `source` attribute records which Mac last reported the value.
+    Identity is keyed on the peripheral's slugified name (see read_bluetooth)
+    — discovery topic, unique_id, device identifiers and state topic all omit
+    the publishing Mac *and* the Bluetooth address. So several Macs running
+    this script publish to the *exact same* retained topics: the peripheral
+    shows up once in HA, last-writer-wins, and a rotating address no longer
+    spawns duplicates. The `source` attribute records which Mac last reported
+    the value and `battery_source` how it was measured.
     """
     prefix = cfg["discovery_prefix"]
     source = cfg["device"]["name"]
@@ -256,8 +315,9 @@ def build_bluetooth_messages(cfg: dict, devices: list[dict]) -> list[dict]:
             "identifiers": [f"battery_telemetry_bt_{bt_id}"],
             "name": dev["name"],
         }
-        if dev.get("address"):
-            device_block["connections"] = [["mac", dev["address"]]]
+        # Deliberately no "connections": [["mac", …]] — a rotating address
+        # would churn the HA device registry on every scan. The current
+        # address is reported as a sensor attribute instead.
         if dev.get("minor_type"):
             device_block["model"] = dev["minor_type"]
 
@@ -270,7 +330,11 @@ def build_bluetooth_messages(cfg: dict, devices: list[dict]) -> list[dict]:
                 "state_topic": state_topic,
                 "value_template": f"{{{{ value_json.{key} if value_json.{key} is not none else 'unknown' }}}}",
                 "json_attributes_topic": state_topic,
-                "json_attributes_template": "{{ {'source': value_json.source, 'last_seen': value_json.last_seen} | tojson }}",
+                "json_attributes_template": (
+                    "{{ {'source': value_json.source, 'last_seen': value_json.last_seen, "
+                    "'address': value_json.address, "
+                    "'battery_source': value_json.battery_source} | tojson }}"
+                ),
                 "device_class": "battery",
                 "unit_of_measurement": "%",
                 "device": device_block,
@@ -283,6 +347,8 @@ def build_bluetooth_messages(cfg: dict, devices: list[dict]) -> list[dict]:
         state = dict(dev["batteries"])
         state["source"] = source
         state["last_seen"] = now_str
+        state["address"] = dev.get("address") or None
+        state["battery_source"] = dev.get("battery_source")
         messages.append(
             {"topic": state_topic, "payload": json.dumps(state), "retain": True}
         )
@@ -365,6 +431,78 @@ def prune_legacy_bluetooth(cfg: dict) -> int:
     return 0
 
 
+# A Bluetooth address with the separators stripped: the old identity scheme.
+ADDRESS_ID = re.compile(r"^[0-9a-f]{12}$")
+
+
+def prune_orphan_bluetooth(cfg: dict, dry_run: bool = False) -> int:
+    """Clear retained topics left by the address-keyed Bluetooth identity.
+
+    Peripherals used to be keyed on their Bluetooth address. AirPods rotate
+    that address, so every rotation created a fresh Home Assistant device and
+    abandoned the previous one — dozens of inactive `Case`/`Left`/`Right`
+    entities. Those node ids are always a bare 12-hex-digit address, which the
+    name-based ids can never collide with, so anything matching is an orphan.
+
+    Host-independent, unlike --prune-legacy-bt: run it from any one Mac.
+    """
+    mqtt = cfg["mqtt"]
+    prefix = cfg["discovery_prefix"]
+
+    found: set[str] = set()
+
+    def node_is_address(node: str) -> bool:
+        return bool(ADDRESS_ID.match(node))
+
+    def on_connect(client, userdata, flags, reason_code, properties=None):
+        client.subscribe(f"{prefix}/sensor/+/+/config")
+        client.subscribe("battery-telemetry/bluetooth/+/state")
+
+    def on_message(client, userdata, msg):
+        if not msg.retain or not msg.payload:
+            return  # only delete non-empty retained messages
+        parts = msg.topic.split("/")
+        # discovery: <prefix>/sensor/bt_<address>/<key>/config
+        is_cfg = (msg.topic.endswith("/config") and len(parts) == 5
+                  and parts[1] == "sensor" and parts[2].startswith("bt_")
+                  and node_is_address(parts[2][len("bt_"):]))
+        # state: battery-telemetry/bluetooth/<address>/state
+        is_state = (len(parts) == 4 and parts[0] == "battery-telemetry"
+                    and parts[1] == "bluetooth" and node_is_address(parts[2]))
+        if is_cfg or is_state:
+            found.add(msg.topic)
+
+    client = mqtt_client.Client(
+        callback_api_version=mqtt_client.CallbackAPIVersion.VERSION2,
+        client_id=f"battery-telemetry-prune-orphans-{cfg['device']['id']}",
+    )
+    auth, tls = _mqtt_auth_tls(cfg)
+    if auth:
+        client.username_pw_set(auth["username"], auth["password"])
+    if tls is not None:
+        client.tls_set()
+    client.on_connect = on_connect
+    client.on_message = on_message
+    client.connect(mqtt["host"], int(mqtt["port"]))
+    client.loop_start()
+    try:
+        time.sleep(3.0)  # let retained messages flush in
+        for topic in sorted(found):
+            if dry_run:
+                print(f"  would clear {topic}")
+                continue
+            info = client.publish(topic, payload=b"", retain=True, qos=1)
+            info.wait_for_publish(timeout=5)
+            print(f"  cleared {topic}")
+    finally:
+        client.loop_stop()
+        client.disconnect()
+
+    verb = "Would prune" if dry_run else "Pruned"
+    print(f"{verb} {len(found)} orphaned address-keyed Bluetooth topic(s).")
+    return 0
+
+
 # --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
@@ -378,6 +516,10 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true", help="Print what would be published; don't connect.")
     ap.add_argument("--prune-legacy-bt", action="store_true",
                     help="Clear retained discovery/state from the old per-Mac Bluetooth scheme, then exit.")
+    ap.add_argument("--prune-orphan-bt", action="store_true",
+                    help="Clear retained discovery/state for address-keyed Bluetooth devices "
+                         "(the duplicates left by rotating AirPods addresses), then exit. "
+                         "Combine with --dry-run to preview.")
     args = ap.parse_args()
 
     if not os.path.exists(args.config):
@@ -391,6 +533,9 @@ def main() -> int:
     if args.prune_legacy_bt:
         return prune_legacy_bluetooth(cfg)
 
+    if args.prune_orphan_bt:
+        return prune_orphan_bluetooth(cfg, dry_run=args.dry_run)
+
     battery = read_battery()
     messages = build_messages(cfg, battery)
 
@@ -399,8 +544,12 @@ def main() -> int:
 
     if args.dry_run:
         print("Battery:", json.dumps(battery, indent=2))
-        print("Bluetooth:", json.dumps(
-            [{d["name"]: d["batteries"]} for d in bt_devices], ensure_ascii=False))
+        print("Bluetooth:")
+        for d in bt_devices:
+            print(f"  {d['name']}  id={d['id']}  {d['batteries']}  "
+                  f"via {d['battery_source']}")
+        if reason := ble_battery.unavailable_reason():
+            print(f"  (no live BLE reads: {reason})")
         print(f"\n{len(messages)} MQTT messages -> {cfg['mqtt']['host']}:{cfg['mqtt']['port']}")
         for m in messages:
             print(f"  {m['topic']}  {m['payload']}")
@@ -417,7 +566,9 @@ def main() -> int:
         auth=auth,
         tls=tls,
     )
-    bt_summary = ", ".join(d["name"] for d in bt_devices) or "none"
+    bt_summary = ", ".join(
+        f"{d['name']} {d['batteries']} ({d['battery_source']})" for d in bt_devices
+    ) or "none"
     print(f"Published battery ({battery.get('percent')}%, {battery.get('state')}) "
           f"to {mqtt['host']} as '{cfg['device']['name']}'. "
           f"Bluetooth devices: {bt_summary}.")

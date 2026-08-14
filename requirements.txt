@@ -1,1 +1,5 @@
 paho-mqtt>=2.0
+
+# Live BLE Battery Service reads (macOS only). Without it the script falls
+# back to system_profiler, whose battery cache can be badly stale.
+pyobjc-framework-CoreBluetooth>=10.0; sys_platform == "darwin"

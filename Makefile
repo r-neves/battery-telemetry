@@ -57,6 +57,21 @@ run: venv $(CONFIG)
 prune-legacy-bt: venv $(CONFIG)
 	$(PYTHON) $(SCRIPT) --prune-legacy-bt
 
+## prune-orphan-bt-dry: Preview which duplicate address-keyed BT topics would go
+.PHONY: prune-orphan-bt-dry
+prune-orphan-bt-dry: venv $(CONFIG)
+	$(PYTHON) $(SCRIPT) --prune-orphan-bt --dry-run
+
+## prune-orphan-bt: Clear duplicate BT devices left by rotating addresses
+.PHONY: prune-orphan-bt
+prune-orphan-bt: venv $(CONFIG)
+	$(PYTHON) $(SCRIPT) --prune-orphan-bt
+
+## ble: Show live BLE Battery Service readings (debug)
+.PHONY: ble
+ble: venv
+	$(PYTHON) $(MAC_DIR)/ble_battery.py
+
 ## install: Install & start the launchd job (runs on interval_seconds)
 .PHONY: install
 install: venv $(CONFIG)
