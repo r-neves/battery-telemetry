@@ -277,11 +277,11 @@ def build_messages(cfg: dict, battery: dict) -> list[dict]:
             payload["unit_of_measurement"] = unit
         if icon:
             payload["icon"] = icon
-        # Don't let unavailable (null) values blow up numeric sensors.
-        if unit or dev_class in ("battery", "temperature", "duration"):
-            payload["value_template"] = (
-                f"{{{{ value_json.{key} if value_json.{key} is not none else 'unknown' }}}}"
-            )
+        # No null-guard on the template: a JSON null renders as the string
+        # "None", which is exactly what HA reads as the `unknown` state on a
+        # numeric sensor. Rendering 'unknown' instead makes HA reject the
+        # update ("has the non-numeric value: 'unknown'") because that string
+        # isn't its null sentinel.
         messages.append({"topic": cfg_topic, "payload": json.dumps(payload), "retain": True})
 
     # Single retained state message with everything.
@@ -328,7 +328,8 @@ def build_bluetooth_messages(cfg: dict, devices: list[dict]) -> list[dict]:
                 "name": friendly,
                 "unique_id": f"battery_telemetry_bt_{bt_id}_{key}",
                 "state_topic": state_topic,
-                "value_template": f"{{{{ value_json.{key} if value_json.{key} is not none else 'unknown' }}}}",
+                # A null renders as "None", HA's sentinel for `unknown`.
+                "value_template": f"{{{{ value_json.{key} }}}}",
                 "json_attributes_topic": state_topic,
                 "json_attributes_template": (
                     "{{ {'source': value_json.source, 'last_seen': value_json.last_seen, "
